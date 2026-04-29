@@ -51,6 +51,14 @@ repos:
         exclude: codegen/.*
   - repo: local
     hooks:
+    - id: check-metadata-sorted
+      name: Check Metadata.yaml operator_name entries are alphabetically sorted
+      language: python
+      entry: python tools/check_metadata_sorted.py
+      files: ^codegen/inputs/Metadata\.yaml$
+      pass_filenames: true
+  - repo: local
+    hooks:
       - id: forbid-pytest-ini
         name: Forbid pytest.ini (use pyproject.toml instead)
         language: fail
