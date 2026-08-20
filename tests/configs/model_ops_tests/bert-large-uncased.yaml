@@ -1,4 +1,5 @@
 test_suite_config:
+  labels: [trunk]
   global:
     supported_dtypes:
       - name: float16
@@ -17,15 +18,7 @@ test_suite_config:
         precision:
           atol: 0.005
           rtol: 0.005
-      - name: int8
-        precision:
-          atol: 0.005
-          rtol: 0.005
-      - name: int16
-        precision:
-          atol: 0.005
-          rtol: 0.005
-      - name: int32
+      - name: half
         precision:
           atol: 0.005
           rtol: 0.005
@@ -33,39 +26,7 @@ test_suite_config:
         precision:
           atol: 0.005
           rtol: 0.005
-      - name: uint8
-        precision:
-          atol: 0.005
-          rtol: 0.005
-      - name: uint16
-        precision:
-          atol: 0.005
-          rtol: 0.005
-      - name: uint32
-        precision:
-          atol: 0.005
-          rtol: 0.005
-      - name: uint64
-        precision:
-          atol: 0.005
-          rtol: 0.005
-      - name: complex32
-        precision:
-          atol: 0.005
-          rtol: 0.005
-      - name: complex64
-        precision:
-          atol: 0.005
-          rtol: 0.005
-      - name: complex128
-        precision:
-          atol: 0.005
-          rtol: 0.005
       - name: bool
-        precision:
-          atol: 0.005
-          rtol: 0.005
-      - name: half
         precision:
           atol: 0.005
           rtol: 0.005
@@ -100,7 +61,6 @@ test_suite_config:
                     position_ids = self.position_ids[:, past_key_values_length : seq_length + past_key_values_length]'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.getitem.1
                 - name: torch.nn.functional.embedding
                   sample_inputs_func:
@@ -131,7 +91,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.nn.functional.embedding.1
                 - name: torch.nn.functional.embedding
                   sample_inputs_func:
@@ -144,7 +103,7 @@ test_suite_config:
                           device: cuda
                           init: randint
                           init_args:
-                            high: 1000
+                            high: 2
                       - tensor:
                           shape: [2, 1024]
                           stride: [1024, 1]
@@ -162,7 +121,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.nn.functional.embedding.2
                 - name: torch.add
                   sample_inputs_func:
@@ -185,7 +143,6 @@ test_suite_config:
                     code: embeddings = inputs_embeds + token_type_embeddings'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.add.1
                 - name: torch.nn.functional.embedding
                   sample_inputs_func:
@@ -198,7 +155,7 @@ test_suite_config:
                           device: cuda
                           init: randint
                           init_args:
-                            high: 1000
+                            high: 512
                       - tensor:
                           shape: [512, 1024]
                           stride: [1024, 1]
@@ -216,7 +173,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.nn.functional.embedding.3
                 - name: torch.nn.functional.layer_norm
                   sample_inputs_func:
@@ -249,7 +205,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.nn.functional.layer_norm.1
                 - name: torch.nn.functional.dropout
                   sample_inputs_func:
@@ -269,28 +224,8 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.nn.functional.dropout.1
-                - name: torch_spyre._monkey_patch.spyre_to
-                  sample_inputs_func:
-                    args:
-                      - tensor:
-                          shape: [1, 13]
-                          stride: [13, 1]
-                          storage_offset: 0
-                          dtype: torch.int64
-                          device: cuda
-                          init: randint
-                          init_args:
-                            high: 1000
-                  description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L824 in _preprocess_mask_arguments,
-                    code: attention_mask = attention_mask.to(device=inputs_embeds.device, dtype=torch.bool)'
-                  tags:
-                    - tensorsoncpu
-                    - torch_spyre._monkey_patch.spyre_to.1
-                  kwargs:
-                    device: cuda
-                    dtype: torch.bool
+
                 - name: torch.arange
                   sample_inputs_func:
                     args:
@@ -299,7 +234,6 @@ test_suite_config:
                     = torch.arange(batch_size, device=device)'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.arange.1
                   kwargs:
                     device: cuda
@@ -320,7 +254,6 @@ test_suite_config:
                     = torch.arange(q_length, device=device) + q_offset'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.add.2
                 - name: torch.getitem
                   sample_inputs_func:
@@ -339,7 +272,6 @@ test_suite_config:
                     code: batch_indices = batch_indices[:, None, None, None]'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.getitem.2
                 - name: torch.getitem
                   sample_inputs_func:
@@ -358,7 +290,6 @@ test_suite_config:
                     code: q_indices = q_indices[None, None, :, None]'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.getitem.3
                 - name: torch.new_ones
                   sample_inputs_func:
@@ -377,7 +308,6 @@ test_suite_config:
                     = q_idx.new_ones((), dtype=torch.bool)'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.new_ones.1
                   kwargs:
                     dtype: torch.bool
@@ -398,7 +328,6 @@ test_suite_config:
                     code: return q_idx >= 0'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.ge.1
                 - name: torch.to
                   sample_inputs_func:
@@ -414,14 +343,13 @@ test_suite_config:
                     = result & mask(batch_idx, head_idx, q_idx, kv_idx).to(result.device)'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.to.1
                 - name: torch.and_
                   sample_inputs_func:
                     args:
                       - tensor:
-                          shape: []
-                          stride: []
+                          shape: [1, 1, 13, 1]
+                          stride: [13, 13, 1, 1]
                           storage_offset: 0
                           dtype: torch.bool
                           device: cuda
@@ -434,7 +362,6 @@ test_suite_config:
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L56 in and_mask, code: result
                     = result & mask(batch_idx, head_idx, q_idx, kv_idx).to(result.device)'
                   tags:
-                    - tensorsoncpu
                     - torch.and_.1
                 - name: torch.getitem
                   sample_inputs_func:
@@ -453,7 +380,7 @@ test_suite_config:
                             device: cuda
                             init: randint
                             init_args:
-                              high: 1000
+                              high: 1
                           - shape: [1, 1, 1, 13]
                             stride: [13, 13, 13, 1]
                             storage_offset: 0
@@ -461,12 +388,11 @@ test_suite_config:
                             device: cuda
                             init: randint
                             init_args:
-                              high: 1000
+                              high: 13
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L177 in inner_mask, code: return
                     padding_mask[batch_idx, kv_idx]'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.getitem.4
                 - name: torch.to
                   sample_inputs_func:
@@ -482,7 +408,6 @@ test_suite_config:
                     = result & mask(batch_idx, head_idx, q_idx, kv_idx).to(result.device)'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.to.2
                 - name: torch.and_
                   sample_inputs_func:
@@ -502,7 +427,6 @@ test_suite_config:
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L56 in and_mask, code: result
                     = result & mask(batch_idx, head_idx, q_idx, kv_idx).to(result.device)'
                   tags:
-                    - tensorsoncpu
                     - torch.and_.2
                 - name: torch.Tensor.expand
                   sample_inputs_func:
@@ -521,7 +445,6 @@ test_suite_config:
                     = attention_mask.expand(batch_size, -1, q_length, kv_length)'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.Tensor.expand.1
                 - name: torch.nn.functional.linear
                   sample_inputs_func:
@@ -551,7 +474,6 @@ test_suite_config:
                     code: query_layer = self.query(hidden_states).view(*hidden_shape).transpose(1, 2)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.nn.functional.linear.1
                 - name: torch.Tensor.view
                   sample_inputs_func:
@@ -572,7 +494,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.Tensor.view.1
                 - name: torch.transpose
                   sample_inputs_func:
@@ -591,7 +512,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.transpose.1
                 - name: torch.nn.functional.scaled_dot_product_attention
                   sample_inputs_func:
@@ -617,11 +537,16 @@ test_suite_config:
                           dtype: torch.float32
                           device: cuda
                           init: rand
+                      - tensor:
+                          shape: [1, 1, 13, 13]
+                          stride: [169, 169, 13, 1]
+                          storage_offset: 0
+                          dtype: torch.bool
+                          device: cuda
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
                     code: attn_output = torch.nn.functional.scaled_dot_product_attention('
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.nn.functional.scaled_dot_product_attention.1
                   kwargs:
                     dropout_p: 0.0
@@ -644,7 +569,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.transpose.2
                 - name: torch.Tensor.contiguous
                   sample_inputs_func:
@@ -660,7 +584,6 @@ test_suite_config:
                     code: attn_output = attn_output.transpose(1, 2).contiguous()'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.Tensor.contiguous.1
                 - name: torch.reshape
                   sample_inputs_func:
@@ -678,7 +601,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.reshape.1
                 - name: torch.Tensor.contiguous
                   sample_inputs_func:
@@ -694,7 +616,6 @@ test_suite_config:
                     code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.Tensor.contiguous.2
                 - name: torch.nn.functional.linear
                   sample_inputs_func:
@@ -724,7 +645,6 @@ test_suite_config:
                     code: hidden_states = self.dense(hidden_states)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.nn.functional.linear.2
                 - name: torch.nn.functional.gelu
                   sample_inputs_func:
@@ -739,7 +659,6 @@ test_suite_config:
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/activations.py#L89 in forward, code: return self.act(input)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.nn.functional.gelu.1
                 - name: torch.nn.functional.linear
                   sample_inputs_func:
@@ -769,7 +688,6 @@ test_suite_config:
                     code: hidden_states = self.dense(hidden_states)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.nn.functional.linear.3
                 - name: torch.nn.functional.gelu
                   sample_inputs_func:
@@ -784,7 +702,6 @@ test_suite_config:
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/activations.py#L89 in forward, code: return self.act(input)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.nn.functional.gelu.2
                 - name: torch.nn.functional.linear
                   sample_inputs_func:
@@ -814,5 +731,4 @@ test_suite_config:
                     code: hidden_states = self.decoder(hidden_states)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.nn.functional.linear.4
