@@ -91,13 +91,13 @@ test_suite_config:
                           init: randint
                           init_args:
                             high: 1000
+                    kwargs:
+                      dim: 1
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/xlm_roberta/modeling_xlm_roberta.py#L154
                     in create_position_ids_from_input_ids, code: incremental_indices = (torch.cumsum(mask, dim=1).type_as(mask) + past_key_values_length)
                     * mask'
                   tags:
                     - torch.cumsum.1
-                  kwargs:
-                    dim: 1
                 - name: torch.type_as
                   sample_inputs_func:
                     args:
@@ -244,12 +244,13 @@ test_suite_config:
                           init: randint
                           init_args:
                             high: 514
+                    kwargs:
+                      dim: 1
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/xlm_roberta/modeling_xlm_roberta.py#L106
                     in forward, code: buffered_token_type_ids = torch.gather(buffered_token_type_ids, dim=1, index=position_ids)'
                   tags:
                     - torch.gather.1
-                  kwargs:
-                    dim: 1
+
                 - name: torch.Tensor.expand
                   sample_inputs_func:
                     args:
@@ -437,13 +438,14 @@ test_suite_config:
                   sample_inputs_func:
                     args:
                       - value: 1
+                    kwargs:
+                      device: cuda
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L507 in sdpa_mask, code: batch_arange
                     = torch.arange(batch_size, device=device)'
                   tags:
                     - constant
                     - torch.arange.1
-                  kwargs:
-                    device: cuda
+
                 - name: torch.add
                   sample_inputs_func:
                     args:
@@ -511,13 +513,13 @@ test_suite_config:
                           init_args:
                             high: 1000
                       - value: ()
+                    kwargs:
+                      dtype: torch.bool
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L54 in and_mask, code: result
                     = q_idx.new_ones((), dtype=torch.bool)'
                   tags:
                     - constant
                     - torch.new_ones.1
-                  kwargs:
-                    dtype: torch.bool
                 - name: torch.ge
                   sample_inputs_func:
                     args:
@@ -750,15 +752,15 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.bool
                           device: cuda
+                    kwargs:
+                      dropout_p: 0.0
+                      scale: 0.125
+                      is_causal: false
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
                     code: attn_output = torch.nn.functional.scaled_dot_product_attention('
                   tags:
                     - bf16operation
                     - torch.nn.functional.scaled_dot_product_attention.1
-                  kwargs:
-                    dropout_p: 0.0
-                    scale: 0.125
-                    is_causal: false
                 - name: torch.transpose
                   sample_inputs_func:
                     args:

@@ -446,7 +446,6 @@ cases:
       dtype=torch.bool)'
     marks:
       - constant
-
     kwmap:
       dtype: torch.bool
   - name: torch.ge.1_spyre
