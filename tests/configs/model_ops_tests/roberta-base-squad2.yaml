@@ -419,9 +419,10 @@ test_suite_config:
                           dtype: torch.float32
                           device: cuda
                           init: rand
-                      - value: 0.1
-                      - value: false
-                      - value: false
+                    kwargs:
+                      p: 0.1
+                      training: false
+                      inplace: false
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/roberta/modeling_roberta.py#L120 in forward,
                     code: embeddings = self.dropout(embeddings)'
                   tags:
