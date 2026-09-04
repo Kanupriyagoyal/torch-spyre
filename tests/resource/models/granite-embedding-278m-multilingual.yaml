@@ -363,14 +363,15 @@ cases:
           dtype: torch.bfloat16
           device: cuda
           init: rand
-      - value: 0.1
-      - value: false
-      - value: false
     description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/xlm_roberta/modeling_xlm_roberta.py#L120 in forward,
       code: embeddings = self.dropout(embeddings)'
     marks:
       - bf16operation
       - constant
+    kwmap:
+      p: 0.1
+      training: false
+      inplace: false
 
   - name: torch.arange.1
     op: torch.arange
