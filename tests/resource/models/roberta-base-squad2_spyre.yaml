@@ -1,4 +1,4 @@
-model: roberta-base-squad2_spyre
+model: roberta-base-squad2
 defaults:
   dtype: fp16
   seed: 123
