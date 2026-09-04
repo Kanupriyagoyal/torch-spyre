@@ -177,14 +177,15 @@ cases:
           dtype: torch.float32
           device: cuda
           init: rand
-      - value: 0.1
-      - value: false
-      - value: false
     description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/bert/modeling_bert.py#L107 in forward, code: embeddings
       = self.dropout(embeddings)'
     marks:
       - fp32operation
       - constant
+    kwmap:
+      p: 0.1
+      training: false
+      inplace: false
 
   - name: torch.arange.1
     op: torch.arange

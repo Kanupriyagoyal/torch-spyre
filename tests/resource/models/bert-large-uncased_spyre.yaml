@@ -172,13 +172,14 @@ cases:
           dtype: torch.float16
           device: cuda
           init: rand
-      - value: 0.1
-      - value: false
-      - value: false
     description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/bert/modeling_bert.py#L107 in forward, code: embeddings
       = self.dropout(embeddings)'
     marks:
       - constant
+    kwmap:
+      p: 0.1
+      training: false
+      inplace: false
 
   - name: torch.arange.1_spyre
     op: torch.arange
