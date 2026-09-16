@@ -1,9 +1,8 @@
 name: model-ops-tests-nightly
 
 on:
-  # Run on a schedule (nightly at 2 AM UTC)
-  schedule:
-    - cron: 0 2 * * *
+  workflow_call: null
+  workflow_dispatch: null
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -16,7 +15,7 @@ defaults:
 permissions:
   contents: read
   checks: write
-  actions: read    # needed by push-model-ops-logs-to-clickhouse to fetch job logs
+  actions: read
 
 jobs:
   # Build the torch_spyre._C extension ONCE and publish it as a wheel; every

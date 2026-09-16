@@ -1,12 +1,10 @@
 name: push-model-ops-logs-to-clickhouse
 
-# Triggers automatically when model-ops-tests completes, OR manually so you
-# can re-ingest any historical run by supplying its run ID.
+# NOTE: automatic ingest after the weekly run is handled inline in
+# runtests_nightly.yaml (the ingest-model-ops-logs job) because
+# workflow_run does not fire for workflow_call children.
+# This workflow is kept for MANUAL re-ingestion of any historical run only.
 on:
-  workflow_run:
-    workflows:
-      - model-ops-tests-nightly
-    types: [completed]
   workflow_dispatch:
     inputs:
       gha_run_id:

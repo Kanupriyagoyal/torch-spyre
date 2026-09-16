@@ -34,6 +34,7 @@ concurrency:
 permissions:
   contents: read
   checks: write
+  actions: read    # needed by ingest-model-ops-logs to fetch job logs
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -61,7 +62,229 @@ jobs:
       CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
 
   # ---------------------------------------------------------------------------
-  # Job 2: run-spyre-unit-tests (fan-in gate)
+  # Job 2: model-ops tests — run the model-level op coverage suite.
+  # Lives in its own workflow (model_ops_tests_nightly.yaml) and is called
+  # here so it runs as part of the weekly trunk cadence alongside the unit tests.
+  # ---------------------------------------------------------------------------
+  run-model-ops-tests:
+    uses: ./.github/workflows/model_ops_tests_nightly.yaml
+
+  # ---------------------------------------------------------------------------
+  # Job 3: ingest model-ops results into ClickHouse.
+  # Mirrors push-model-ops-logs-to-clickhouse.yaml but triggered here directly
+  # (workflow_run does not fire for workflow_call children).
+  # ---------------------------------------------------------------------------
+  ingest-model-ops-logs:
+    name: Parse model-ops logs -> ClickHouse
+    needs: run-model-ops-tests
+    if: always() && needs.run-model-ops-tests.result != 'cancelled'
+    runs-on:
+      - x86_64
+      - linux
+      - image_ingest
+    timeout-minutes: 15
+    env:
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+      TRIGGERING_RUN_ID: ${{ github.run_id }}
+      TRIGGERING_WORKFLOW: model-ops-tests-nightly
+      TRIGGERING_BRANCH: ${{ github.ref_name }}
+      TRIGGERING_SHA: ${{ github.sha }}
+    steps:
+      - name: Checkout scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          sparse-checkout: |
+            .github/scripts/parse_model_ops_logs.py
+            .github/scripts/ingest_model_ops.py
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: latest-known
+
+      - name: Setup venv
+        run: |
+          uv venv
+          source .venv/bin/activate
+          echo "VIRTUAL_ENV $VIRTUAL_ENV"
+
+      - name: Install Python dependencies
+        run: |
+          source .venv/bin/activate
+          uv pip install clickhouse-connect regex
+
+      - name: Setup the GitHub CLI
+        env:
+          GH_CLI_VERSION_FLOOR: 2.98.0
+        run: |
+          set -euo pipefail
+          GH_CLI_VERSION="$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest \
+                              | jq -r '.tag_name // empty' | sed 's/^v//')" || GH_CLI_VERSION=""
+          if [ -z "$GH_CLI_VERSION" ]; then
+            echo "api.github.com unreachable; flooring to ${GH_CLI_VERSION_FLOOR}"
+            GH_CLI_VERSION="${GH_CLI_VERSION_FLOOR}"
+          fi
+          curl -fsSL \
+            "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.tar.gz" \
+            -o "${RUNNER_TEMP}/gh-cli.tar.gz"
+          mkdir -p "${RUNNER_TEMP}/gh-cli"
+          tar -xzf "${RUNNER_TEMP}/gh-cli.tar.gz" -C "${RUNNER_TEMP}/gh-cli" --strip-components=1
+          echo "${RUNNER_TEMP}/gh-cli/bin" >> "${GITHUB_PATH}"
+
+      - name: Download job logs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p raw_logs
+
+          gh api \
+            "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/jobs" \
+            --paginate \
+            --jq '.jobs[] | select(.name | startswith("model-ops-tests")) | {id: .id, name: .name}' \
+          > /tmp/jobs.jsonl
+
+          python3 - << 'PYEOF'
+          import json, os, re, subprocess, sys
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          jobs = [json.loads(l) for l in open("/tmp/jobs.jsonl") if l.strip()]
+
+          esc = subprocess.run(
+              ["gh", "api", "--help"], capture_output=True, text=True
+          ).stdout
+          esc_flag = (
+              ["--allow-escape-sequences"] if "--allow-escape-sequences" in esc else []
+          )
+
+          downloaded = 0
+          for idx, j in enumerate(jobs):
+              safe   = re.sub(r"[^\w\s\-\.]", "", j["name"]).strip()
+              out    = f"raw_logs/{idx}_{safe}.txt"
+              result = subprocess.run(
+                  ["gh", "api", *esc_flag,
+                   f"/repos/{repo}/actions/jobs/{j['id']}/logs"],
+                  capture_output=True, env={**os.environ},
+              )
+              if result.returncode == 0 and result.stdout:
+                  open(out, "wb").write(result.stdout)
+                  downloaded += 1
+                  print(f"  OK   {out}")
+              else:
+                  err = result.stderr.decode("utf-8", "replace").strip()
+                  print(f"  SKIP {j['name']} (rc={result.returncode}): {err}")
+
+          print(f"[info] downloaded {downloaded}/{len(jobs)} job logs")
+          if jobs and downloaded == 0:
+              print(f"::error::downloaded 0 of {len(jobs)} job logs -- aborting")
+              sys.exit(1)
+          PYEOF
+
+      - name: Parse logs
+        run: |
+          source .venv/bin/activate
+
+          SAFE_WF=$(echo "${TRIGGERING_WORKFLOW}" | tr ' ' '_')
+          JSON_FILE="model_ops_${SAFE_WF}_${TRIGGERING_RUN_ID}.json"
+          echo "JSON_FILE=${JSON_FILE}" >> "$GITHUB_ENV"
+
+          LOG_FILE="model_ops_log_${TRIGGERING_SHA}_${TRIGGERING_RUN_ID}.txt"
+          echo "LOG_FILE=${LOG_FILE}" >> "$GITHUB_ENV"
+
+          python3 .github/scripts/parse_model_ops_logs.py \
+            --log-dir raw_logs \
+            --run-id  "${TRIGGERING_RUN_ID}" \
+            --out     "${JSON_FILE}" \
+            --log-out "${LOG_FILE}"
+
+          TOTAL_VARIANTS=$(python3 -c "
+          import json, sys
+          try:
+              recs = json.load(open('${JSON_FILE}'))
+              total = sum(
+                  len(op.get('variants', []))
+                  for r in recs
+                  for cat in (r.get('operations') or {}).values()
+                  for op in (cat if isinstance(cat, list) else [])
+              )
+              print(total)
+          except Exception as e:
+              print(0)
+          " 2>/dev/null || echo 0)
+
+          echo "TOTAL_VARIANTS=${TOTAL_VARIANTS}" >> "$GITHUB_ENV"
+          echo "[info] Total parsed variants: ${TOTAL_VARIANTS}"
+          if [ "${TOTAL_VARIANTS}" -eq 0 ]; then
+            echo "HAS_VARIANT_DATA=false" >> "$GITHUB_ENV"
+            echo "[warn] No variant data found in parsed JSON — skipping ClickHouse ingest to avoid overwriting good data with empty suites."
+          else
+            echo "HAS_VARIANT_DATA=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Ingest into ClickHouse
+        if: env.HAS_VARIANT_DATA == 'true'
+        run: |
+          source .venv/bin/activate
+          python3 .github/scripts/ingest_model_ops.py \
+            --json-file "${JSON_FILE}" \
+            --workflow  "${TRIGGERING_WORKFLOW}" \
+            --branch    "${TRIGGERING_BRANCH}" \
+            --sha       "${TRIGGERING_SHA}" \
+            --run-id    "${TRIGGERING_RUN_ID}"
+
+      - name: Upload Logs artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: model_ops_log_${{ env.TRIGGERING_SHA }}_${{ env.TRIGGERING_RUN_ID }}
+          path: ${{ env.LOG_FILE }}
+          retention-days: 10
+
+      - name: Upload JSON artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ env.JSON_FILE }}
+          path: ${{ env.JSON_FILE }}
+          retention-days: 10
+
+      - name: Summary
+        if: always()
+        run: |-
+          SUITE_COUNT=$(python3 -c "
+          import json, sys
+          try:
+              data = json.load(open('${JSON_FILE}'))
+              passed  = sum(1 for r in data if r.get('outcome') == 'passed')
+              failed  = sum(1 for r in data if r.get('outcome') == 'failed')
+              error   = sum(1 for r in data if r.get('outcome') == 'error')
+              unknown = sum(1 for r in data if r.get('outcome') == 'unknown')
+              print(f'{len(data)}|{passed}|{failed}|{error}|{unknown}')
+          except Exception:
+              print('0|0|0|0|0')
+          " 2>/dev/null || echo '0|0|0|0|0')
+
+          IFS='|' read -r TOTAL PASSED FAILED ERROR UNKNOWN <<< "${SUITE_COUNT}"
+          {
+            echo "### Model-Ops ClickHouse Ingest Summary"
+            echo "| Key | Value |"
+            echo "|---|---|"
+            echo "| Triggering workflow | ${TRIGGERING_WORKFLOW} |"
+            echo "| Triggering run ID   | ${TRIGGERING_RUN_ID} |"
+            echo "| Branch              | ${TRIGGERING_BRANCH} |"
+            echo "| Commit SHA          | ${TRIGGERING_SHA:0:12} |"
+            echo "| Total suites        | ${TOTAL} |"
+            echo "| Passed              | ${PASSED} |"
+            echo "| Failed              | ${FAILED} |"
+            echo "| Error               | ${ERROR} |"
+            echo "| Unknown             | ${UNKNOWN} |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Job 4: run-spyre-unit-tests (fan-in gate)
   #
   # Fans in the reusable workflow result. Reports a single green/red status.
   #   run-tests result = success -> all suites passed -> green
@@ -70,7 +293,7 @@ jobs:
   run-spyre-unit-tests:
     name: Run Spyre unit tests
     runs-on: ubuntu-latest
-    needs: [run-tests]
+    needs: [run-tests, run-model-ops-tests]
     if: always()
     steps:
       - name: Evaluate test results
