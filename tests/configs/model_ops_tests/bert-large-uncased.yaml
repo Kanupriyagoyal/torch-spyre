@@ -340,7 +340,7 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.bool
                           device: cuda
-                      - value: cpu
+                      - value: cuda
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L56 in and_mask, code: result
                     = result & mask(batch_idx, head_idx, q_idx, kv_idx).to(result.device)'
                   tags:
@@ -405,7 +405,7 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.bool
                           device: cuda
-                      - value: cpu
+                      - value: cuda
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/masking_utils.py#L56 in and_mask, code: result
                     = result & mask(batch_idx, head_idx, q_idx, kv_idx).to(result.device)'
                   tags:
