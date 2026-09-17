@@ -84,7 +84,7 @@ jobs:
     #     config: <filename inside tests/configs/model_ops_tests/>
     #
     # The JUnit XML report is automatically named after the config file, e.g.:
-    #   granite-4.1-8b_spyre.yaml  ->  granite-4.1-8b_spyre.xml
+    #   granite-4.1-8b.yaml  ->  granite-4.1-8b.xml
     # ---------------------------------------------------------------------------
     strategy:
       fail-fast: false   # run all suites even if one fails

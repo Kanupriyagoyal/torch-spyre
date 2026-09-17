@@ -14,6 +14,7 @@
 
 import dataclasses
 import math
+import sys
 import unittest
 from unittest import mock
 
@@ -389,6 +390,33 @@ class TestBuildingBlocks(unittest.TestCase):
             rtol=0.1,
         )
 
+    @mock.patch(
+        "torch_spyre._inductor.decompositions._SDPA_MAX_BURST_EFFICIENT_KV_BLOCK_SIZE",
+        64,
+    )
+    @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
+    def test_sdpa_lk_uses_for_each_tile(self):
+        """Multiple K/V blocks lower to one counted loop instead of unrolling."""
+        batch, heads, query_length, kv_length, head_dim = 1, 2, 64, 128, 128
+        query = torch.randn(batch, heads, query_length, head_dim, dtype=torch.float16)
+        key = torch.randn(batch, heads, kv_length, head_dim, dtype=torch.float16)
+        value = torch.randn(batch, heads, kv_length, head_dim, dtype=torch.float16)
+
+        def sdpa(query, key, value):
+            return F.scaled_dot_product_attention(query, key, value)
+
+        expected = sdpa(query, key, value)
+        actual, sources = run_and_get_code(
+            torch.compile(sdpa, dynamic=False),
+            query.to("spyre"),
+            key.to("spyre"),
+            value.to("spyre"),
+        )
+
+        torch.testing.assert_close(actual.cpu(), expected, atol=0.1, rtol=0.1)
+        self.assertEqual(sum(source.count("LoopSpec(") for source in sources), 1)
+        self.assertNotIn("while_loop_carry_snapshot", "\n".join(sources))
+
     def test_causal_sdpa_unpadded_kv_no_inf(self):
         """Regression: causal SDPA must not produce inf when seqlen_kv % 64 != 0.
 
@@ -543,7 +571,54 @@ class TestBuildingBlocks(unittest.TestCase):
             reshape_output=True,
         )
 
-    @unittest.skip("Runs for long time, possibly hang.  Keeping disabled")
+    def test_siglip_multicrop_attention_span(self):
+        """A seven-crop SigLIP prefill must fit each tiled BMM under 256 MB."""
+        B, H, L, D = 7, 16, 576, 128
+        generator = torch.Generator().manual_seed(1337)
+        q = torch.randn((B, L, H, D), dtype=torch.bfloat16, generator=generator)
+        k = torch.randn((B, L, H, D), dtype=torch.bfloat16, generator=generator)
+        v = torch.randn((B, L, H, D), dtype=torch.bfloat16, generator=generator)
+
+        def sdpa(q, k, v):
+            return F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                dropout_p=0.0,
+                scale=72**-0.5,
+            )
+
+        expected = sdpa(q, k, v)
+        actual = torch.compile(sdpa, dynamic=False)(
+            q.to("spyre"), k.to("spyre"), v.to("spyre")
+        ).cpu()
+        torch.testing.assert_close(actual, expected, atol=0.2, rtol=0.2)
+
+    def test_sdpa_head_tiles_limit_heads_per_tile(self):
+        """The hint value is a tile count, not a per-tile head extent."""
+        # The backend entry point loaded by ``import torch`` has already
+        # registered this module. Fetch it without importing torch_spyre here.
+        decompositions = sys.modules["torch_spyre._inductor.decompositions"]
+        num_head_tiles = decompositions._sdpa_num_head_tiles
+
+        self.assertEqual(num_head_tiles(32), 8)
+        self.assertEqual(num_head_tiles(16), 4)
+        self.assertEqual(num_head_tiles(14), 7)
+
+    def test_granite_gqa_prefill_sequence_tiling(self):
+        """Native GQA remains unexpanded when Lq exceeds one sequence tile."""
+        self._run_granite_gqa_with_finite_broadcast_mask(
+            LQ=1024,
+            dtype=torch.bfloat16,
+            name_inputs=True,
+            LK=1024,
+            transposed_inputs=True,
+            reshape_output=True,
+        )
+
+    @unittest.skip(
+        "Test skipped solely because of runtime.  It passes but takes over 10 minutes."
+    )
     @mock.patch("torch_spyre._inductor.decompositions._SDPA_MAX_SEQUENCE_TILE_SIZE", 64)
     def test_granite_gqa_prefill_grouped_sixteen_by_sixteen_tiling(self):
         """Sixteen KV loop groups preserve Granite's online-softmax carries."""
