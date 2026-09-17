@@ -91,13 +91,13 @@ test_suite_config:
                           init: randint
                           init_args:
                             high: 1000
+                    kwargs:
+                      dim: 1
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/xlm_roberta/modeling_xlm_roberta.py#L154
                     in create_position_ids_from_input_ids, code: incremental_indices = (torch.cumsum(mask, dim=1).type_as(mask) + past_key_values_length)
                     * mask'
                   tags:
                     - torch.cumsum.1
-                  kwargs:
-                    dim: 1
                 - name: torch.type_as
                   sample_inputs_func:
                     args:
@@ -423,9 +423,10 @@ test_suite_config:
                           dtype: torch.bfloat16
                           device: cuda
                           init: rand
-                      - value: 0.1
-                      - value: false
-                      - value: false
+                    kwargs:
+                      p: 0.1
+                      training: false
+                      inplace: false
                   description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/xlm_roberta/modeling_xlm_roberta.py#L120
                     in forward, code: embeddings = self.dropout(embeddings)'
                   tags:
