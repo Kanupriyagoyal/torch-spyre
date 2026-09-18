@@ -183,7 +183,13 @@ cases:
           init: randint
           init_args:
             high: 1000
-      - tensor:
+    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/roberta/modeling_roberta.py#L106 in forward, code: buffered_token_type_ids
+      = torch.gather(buffered_token_type_ids, dim=1, index=position_ids)'
+    marks: null
+    kwmap:
+      dim: 1
+      index:
+        tensor:
           shape: [1, 40]
           stride: [40, 1]
           storage_offset: 0
@@ -192,11 +198,6 @@ cases:
           init: randint
           init_args:
             high: 514
-    description: 'https://github.com/huggingface/transformers/blob/v5.15.0/src/transformers/models/roberta/modeling_roberta.py#L106 in forward, code: buffered_token_type_ids
-      = torch.gather(buffered_token_type_ids, dim=1, index=position_ids)'
-    marks: null
-    kwmap:
-      dim: 1
   - name: torch.Tensor.expand.2
     op: torch.Tensor.expand
     inputs:
@@ -498,8 +499,8 @@ cases:
     marks:
       - constant
 
-  - name: torch.and_.1
-    op: torch.and_
+  - name: torch.bitwise_and.1
+    op: torch.bitwise_and
     inputs:
       - tensor:
           shape: [1, 1, 40, 1]
@@ -561,8 +562,8 @@ cases:
     marks:
       - constant
 
-  - name: torch.and_.2
-    op: torch.and_
+  - name: torch.bitwise_and.2
+    op: torch.bitwise_and
     inputs:
       - tensor:
           shape: [1, 1, 40, 1]
