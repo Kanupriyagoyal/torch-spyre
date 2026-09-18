@@ -21,6 +21,7 @@
 #include <c10/core/Stream.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -33,6 +34,7 @@
 #include "logging.h"
 #include "module.h"
 #include "spyre_allocator.h"
+#include "spyre_composite_address.h"
 #include "spyre_error.h"
 #include "spyre_guard.h"
 #include "spyre_mem.h"
@@ -145,8 +147,9 @@ int SpyreStream::priority() const {
 bool SpyreStream::query() const {
   c10::DeviceGuard guard(stream_.device());
 
-  DEBUGINFO("SpyreStream::query() - stream ", id(), " on device ",
-            static_cast<int>(device().index()));
+  SPYRE_RUNTIME_DEBUG() << __func__ << ": SpyreStream::query() - stream "
+                        << id() << " on device "
+                        << static_cast<int>(device().index());
 
   flex::RuntimeStream* handle = resolveRuntimeHandle();
   return handle->query();
@@ -156,8 +159,9 @@ void SpyreStream::synchronize() const {
   RECORD_FUNCTION("host::synchronize", {});
   c10::DeviceGuard device_guard(stream_.device());
 
-  DEBUGINFO("SpyreStream::synchronize() - stream ", id(), " on device ",
-            static_cast<int>(device().index()));
+  SPYRE_RUNTIME_DEBUG() << __func__ << ": SpyreStream::synchronize() - stream "
+                        << id() << " on device "
+                        << static_cast<int>(device().index());
 
   resolveRuntimeHandle()->synchronize();
 }
@@ -175,8 +179,10 @@ void SpyreStream::copyProgramAsync(
 
 void SpyreStream::copyAsync(const at::Tensor& src,
                             const at::Tensor& dst) const {
-  DEBUGINFO("src (", src.scalar_type(), ") is on:", src.device());
-  DEBUGINFO("dst (", dst.scalar_type(), ") on:", dst.device());
+  SPYRE_RUNTIME_DEBUG() << __func__ << ": src (" << src.scalar_type()
+                        << ") is on:" << src.device();
+  SPYRE_RUNTIME_DEBUG() << __func__ << ": dst (" << dst.scalar_type()
+                        << ") on:" << dst.device();
 
   // Determine copy direction
   bool host2device = src.is_cpu() && dst.is_privateuseone();
@@ -192,16 +198,11 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     // Get SpyreTensorLayout using the public API
     SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
 
-    // Extract device allocation from Spyre tensor storage
-    auto* spyre_impl =
-        static_cast<SpyreTensorImpl*>(dev_tensor->unsafeGetTensorImpl());
-    auto& storage = spyre_impl->storage();
-    auto* ctx = static_cast<SharedOwnerCtx*>(storage.data_ptr().get_context());
-
     DataConversionInfo dci = generate_dci(
         cpu_tensor, dev_tensor, stl, cpu_tensor->storage_offset(), host2device);
 
-    copyAsyncImpl(cpu_ptr, &ctx->composite_addr, &dci, host2device);
+    copyAsyncImpl(cpu_ptr, get_composite_address(*dev_tensor), &dci,
+                  host2device);
 
   } else {
     TORCH_CHECK(false, "Unsupported copy types: src on ", src.device(),
@@ -283,16 +284,31 @@ void SpyreStream::launch(const JobPlan& plan,
                 " must be on Spyre device, got ", args[i].device());
   }
 
+  // Two-stream overlap topology:
+  //   S_dev  = this stream (the default) — Compute (+ D2H).
+  //   S_prep = the persistent host-compute stream — HostCompute + H2D.
+  // Compute overlaps HC/H2D because they run on different streams; every op
+  // keeps pipeline_barrier=true (per-stream FIFO). S_prep must be the same
+  // persistent flex handle each launch: getHostComputeStreamById is a pure
+  // lookup of the handle registered once in initializeStreamPoolImpl.
+  const SpyreStream& s_dev = *this;
+  const SpyreStream s_prep =
+      getHostComputeStreamById(kHostComputeStreamStartPerDevice, device());
+
   // Create launch context with tensor arguments and typed symbolic payload.
   // symbolic_args is moved in so the closure in
   // JobPlanStepHostCompute::construct can capture it by value without an extra
   // copy.
   LaunchContext ctx{args, std::move(symbolic_args)};
 
-  // Each JobPlanStep builds its flex operation params and launches them on
-  // this stream in order. flex owns the RuntimeOperation lifecycle.
+  // Split Prep-role steps onto S_prep only when the flex tracker is on; flex
+  // then inserts the cross-stream edges. Off = every step on S_dev (the
+  // single-stream floor). Routing keys on role(), so all-Dev plans never split.
+  const bool should_split = get_hazard_tracker_enabled();
   for (const auto& step : plan.steps) {
-    step->construct(ctx, *this);
+    const SpyreStream& target =
+        (should_split && step->role() == StreamRole::Prep) ? s_prep : s_dev;
+    step->construct(ctx, target);
   }
 }
 
@@ -332,7 +348,9 @@ void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
         " is already registered; only one Spyre device per process is "
         "supported.");
     pool.stream_handle_map[sid] =
-        runtime->createStream(flex::RuntimeStreamPriority::NORMAL);
+        runtime->createStream(flex::RuntimeStreamPriority::NORMAL,
+                              flex::RuntimeStreamMode::STRICT_ORDERING,
+                              /*track_hazards=*/get_hazard_tracker_enabled());
     pool.host_compute_streams[device_index].push_back(sid);
   }
   pool.next_host_compute_idx[device_index] = 0;
@@ -483,7 +501,9 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
     flex::RuntimeStreamPriority streamPriority =
         priority < 0 ? flex::RuntimeStreamPriority::HIGH
                      : flex::RuntimeStreamPriority::NORMAL;
-    flex::RuntimeStream* flex_handle = runtime->createStream(streamPriority);
+    flex::RuntimeStream* flex_handle = runtime->createStream(
+        streamPriority, flex::RuntimeStreamMode::STRICT_ORDERING,
+        /*track_hazards=*/get_hazard_tracker_enabled());
     pool.stream_handle_map[stream_id] = flex_handle;
   }
 

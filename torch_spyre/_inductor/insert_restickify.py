@@ -17,20 +17,26 @@ import logging
 from collections import defaultdict
 from typing import cast
 
+import sympy
+
 import torch
 
 from .constants import ELIDED_COPY_BACK_ATTR
+from .errors import Unsupported
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
 from .pass_utils import redirect_computed_buffer_reads
-from torch._inductor.dependencies import MemoryDep
+from torch._inductor.dependencies import MemoryDep, index_vars_squeeze
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
+    BaseView,
+    Buffer,
     ComputedBuffer,
     FixedLayout,
     InputBuffer,
     IRNode,
+    MutableBox,
     MutationLayoutSHOULDREMOVE,
     Operation,
     ReinterpretView,
@@ -39,11 +45,116 @@ from torch._inductor.ir import (
 )
 from torch_spyre._C import SpyreTensorLayout
 from torch._inductor.virtualized import V
+from torch._inductor.ops_handler import WrapperHandler
 
 from torch.utils._ordered_set import OrderedSet
 
 
 logger = get_inductor_logger("insert_restickify")
+
+
+def _restickify_dep_index(
+    memory_deps: list[MemoryDep], restick_arg_info: dict
+) -> int | None:
+    """Resolve a restickify plan entry to its exact read-metadata slot."""
+    old_name = restick_arg_info["arg_name"]
+    if "dep_index" not in restick_arg_info:
+        matches = [i for i, dep in enumerate(memory_deps) if dep.name == old_name]
+        if len(matches) > 1:
+            raise AssertionError(
+                f"legacy restickify entry for {old_name!r} matches multiple reads"
+            )
+        return matches[0] if matches else None
+
+    expected_index = sympy.sympify(restick_arg_info["dep_index"])
+    matches = [
+        i
+        for i, dep in enumerate(memory_deps)
+        if dep.name == old_name and sympy.sympify(dep.index) == expected_index
+    ]
+    if len(matches) > 1:
+        raise AssertionError(
+            f"restickify edge {old_name}[{expected_index}] matches multiple "
+            "read-metadata slots"
+        )
+    if not matches:
+        raise AssertionError(
+            f"restickify edge {old_name}[{expected_index}] has no matching "
+            "read-metadata slot"
+        )
+
+    return matches[0]
+
+
+class InputEdgeSwapHandler(WrapperHandler):
+    """Patch selected load occurrences without conflating same-name operands.
+
+    A consumer may read one producer in multiple semantic positions, and those
+    positions can require different device layouts. Matching only by buffer
+    name redirects every occurrence to the final clone. Match the normalized
+    dependency index too, and use the occurrence among identical accesses for
+    the exact-alias case where ReadWrites deduplicated two loads.
+
+    swaps is a list of (old_name, dep_index, occurrence, new_name) tuples.
+    index_replacements maps live inner_fn symbols → canonical d* symbols used
+    in dep.index, built positionally from inner_fn_args() at wrap time.
+    """
+
+    def __init__(self, inner, swaps, name_map=None, index_replacements=None):
+        super().__init__(inner)
+        self._swaps_by_name: dict = defaultdict(list)
+        for old_name, dep_index, occurrence, new_name in swaps:
+            self._swaps_by_name[old_name].append((dep_index, occurrence, new_name))
+        self._name_map = {} if name_map is None else name_map
+        self._index_replacements = (
+            {} if index_replacements is None else index_replacements
+        )
+        self._seen: dict = defaultdict(int)
+
+    def load(self, name, index):
+        dep_index = sympy.sympify(index).xreplace(self._index_replacements)
+        matching = [
+            (occurrence, new_name)
+            for expected_index, occurrence, new_name in self._swaps_by_name.get(
+                name, ()
+            )
+            if expected_index == dep_index
+        ]
+        if not matching:
+            return super().load(self._name_map.get(name, name), index)
+        signature = (name, dep_index)
+        occurrence = self._seen[signature]
+        self._seen[signature] += 1
+        targets = [
+            new_name for expected, new_name in matching if expected == occurrence
+        ]
+        assert len(targets) <= 1, (
+            f"multiple restickify targets for load {name}[{index}] "
+            f"occurrence {occurrence}: {targets}"
+        )
+        if targets:
+            target = targets[0]
+        else:
+            # occurrence has no explicit plan entry for this (name, dep_index).
+            # Two sub-cases:
+            # 1. occurrence > all planned occurrences: multiple reads share the same
+            #    dep.index and only one restickify was emitted (all need the same
+            #    layout). Route to the unique restickified buffer.
+            # 2. occurrence < some planned occurrence: a self-alias edge that needed
+            #    no restickify was deliberately skipped in the plan (its occurrence
+            #    was advanced without recording an entry). This occurrence should
+            #    stay on the original buffer.
+            min_planned = min(exp for exp, _ in matching)
+            if occurrence < min_planned:
+                # Gap: this occurrence precedes the first restickify — stay original.
+                return super().load(self._name_map.get(name, name), index)
+            unique_targets = {new_name for _, new_name in matching}
+            assert len(unique_targets) == 1, (
+                f"ambiguous fallback for load {name}[{index}] occurrence {occurrence}: "
+                f"multiple targets {unique_targets}"
+            )
+            target = next(iter(unique_targets))
+        return super().load(target, index)
 
 
 def _fixed_tiled(layout: FixedLayout, stl: SpyreTensorLayout) -> FixedTiledLayout:
@@ -60,16 +171,28 @@ def _fixed_tiled(layout: FixedLayout, stl: SpyreTensorLayout) -> FixedTiledLayou
 def _record_restickify(
     op: Operation,
     dep_name: str,
+    dep_index,
+    occurrence: int,
     target_layout: FixedTiledLayout,
     restickify_plan: dict,
 ) -> None:
-    """Record that op's input arg_name must be restickified to target_layout.
+    """Record that op's input dep_name must be restickified to target_layout.
+
+    dep_index is the SymPy index expression from MemoryDep.index; occurrence is
+    the 0-based count of prior entries with the same (dep_name, dep_index).
+    InputEdgeSwapHandler matches loads by (name, index) identity and uses
+    occurrence as a tiebreaker for same-index loads.
 
     restickify_plan is the deferred execution queue: entries are recorded here during
     finalize_layouts and executed later by insert_restickify.
     """
     restickify_plan[op.get_name()].append(
-        {"arg_name": dep_name, "target_layout": target_layout}
+        {
+            "arg_name": dep_name,
+            "dep_index": dep_index,
+            "occurrence": occurrence,
+            "target_layout": target_layout,
+        }
     )
 
 
@@ -172,7 +295,6 @@ def _create_restickify_node(
     graph_lowering.env[restick_fx_node] = restick_tb
 
     restick_buff.layout = restick_arg_info["target_layout"]
-
     return arg_name, restick_buff
 
 
@@ -185,7 +307,8 @@ def insert_restickify_on_node_inputs(
     to read the new buffer names, and reconstruct the consumer ComputedBuffer to
     invalidate its sizes cache.
     """
-    name_map = {}
+    edge_swaps: list[tuple] = []
+    name_map: dict[str, str] = {}
     try:
         op_index = operations.index(op)
     except ValueError:
@@ -195,7 +318,18 @@ def insert_restickify_on_node_inputs(
 
     for restick_arg_info in resticks_needed:
         old_name, restick_buff = _create_restickify_node(restick_arg_info, op)
-        name_map[old_name] = restick_buff.get_name()
+        new_name = restick_buff.get_name()
+        if "dep_index" in restick_arg_info:
+            edge_swaps.append(
+                (
+                    old_name,
+                    restick_arg_info["dep_index"],
+                    restick_arg_info["occurrence"],
+                    new_name,
+                )
+            )
+        else:
+            name_map[old_name] = new_name
 
         # lower_restickify calls pw.realize() which appends restick_buff to operations.
         # Move it to just before the consumer op to preserve topological order.
@@ -225,32 +359,116 @@ def insert_restickify_on_node_inputs(
                 mem_deps = [
                     d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)
                 ]
-                dep_idxs = [
-                    i
-                    for i, d in enumerate(mem_deps)
-                    if d.name == old_name and i < len(reads_per_dim)
-                ]
+                dep_idx = _restickify_dep_index(mem_deps, restick_arg_info)
+                if dep_idx is not None and dep_idx >= len(reads_per_dim):
+                    raise AssertionError(
+                        f"restickify metadata index {dep_idx} is outside "
+                        f"tiled_dims_per_read ({len(reads_per_dim)} entries)"
+                    )
                 dep_advance = (
-                    copy.deepcopy(reads_per_dim[dep_idxs[0]])
-                    if dep_idxs
+                    copy.deepcopy(reads_per_dim[dep_idx])
+                    if dep_idx is not None
                     else [[] for _ in range(n_levels)]
                 )
+                # squeezed_advance_per_read is the second, independent channel
+                # for the same per-read advance (see CoarseTileInfo), also
+                # matched to reads positionally, so it must be handed over the
+                # same way. Left shared, the stage inherits the consumer's whole
+                # list and its single read picks up whatever advance sat at
+                # index 0 -- for an in-body page gather that is the block
+                # table's per-trip step, applied to the staged pages copy.
+                adv_per_read = getattr(consumer_li, "squeezed_advance_per_read", [])
+                dep_squeezed = (
+                    copy.deepcopy(adv_per_read[dep_idx])
+                    if dep_idx is not None
+                    and adv_per_read
+                    and dep_idx < len(adv_per_read)
+                    else []
+                )
+                if restick_arg_info.get("occurrence", 0) != 0 and (
+                    any(dep_advance) or any(dep_squeezed)
+                ):
+                    raise Unsupported(
+                        f"restickify edge {old_name}[{restick_arg_info['dep_index']}] "
+                        f"occurrence {restick_arg_info['occurrence']} cannot "
+                        "transfer advancing read metadata independently"
+                    )
                 restick_li = copy.copy(consumer_li)
                 restick_li.tiled_dims_per_read = [dep_advance]
+                restick_li.squeezed_advance_per_read = (
+                    [dep_squeezed] if any(dep_squeezed) else []
+                )
                 restick_li.output_tiled_dims = [[] for _ in range(n_levels)]
                 restick_buff.loop_info = restick_li
-                if dep_idxs:
-                    consumer_li.tiled_dims_per_read = [
-                        [[] for _ in range(n_levels)] if i in dep_idxs else entry
-                        for i, entry in enumerate(reads_per_dim)
+                if dep_idx is not None:
+                    consumer_li.tiled_dims_per_read = copy.deepcopy(reads_per_dim)
+                    consumer_li.tiled_dims_per_read[dep_idx] = [
+                        [] for _ in range(n_levels)
                     ]
+                    if adv_per_read:
+                        consumer_li.squeezed_advance_per_read = copy.deepcopy(
+                            adv_per_read
+                        )
+                        consumer_li.squeezed_advance_per_read[dep_idx] = [
+                            [] for _ in range(n_levels)
+                        ]
             else:
                 restick_buff.loop_info = consumer_li
 
-    # Patch inner_fn once with the full name_map covering all restickified args.
+    # Wrap inner_fn with InputEdgeSwapHandler so each load is redirected to
+    # the correct per-edge restickified buffer via index-matched routing.
+    # Then call redirect_computed_buffer_reads with an empty name_map solely for
+    # its ComputedBuffer reconstruction, cache invalidation, and mutation-target
+    # repointing side-effects. The empty map means the NameSwapHandler it installs
+    # is a no-op; it is intentionally kept rather than extracted to avoid
+    # duplicating that reconstruction logic here.
+    orig_inner = op.data.inner_fn
+
+    # Build canonical d* args using the same prefix/squeeze logic as extract_read_writes.
+    # These are the exact SymPy objects that dep.index was built with, so
+    # index_replacements maps live i*/r0_* symbols → canonical d* symbols correctly.
+    (canonical_idx, canonical_ridx), _ = index_vars_squeeze(
+        op.data.get_pointwise_size(), op.data.get_reduction_size(), prefix="d"
+    )
+    canonical_args = (
+        (canonical_idx, canonical_ridx)
+        if op.data.get_reduction_type()
+        else (canonical_idx,)
+    )
+
+    def new_inner_fn(
+        *args,
+        _swaps=edge_swaps,
+        _map=name_map,
+        _orig=orig_inner,
+        _canonical=canonical_args,
+    ):
+        assert len(args) == len(_canonical), (
+            f"inner_fn argument cardinality changed while inserting restickify: "
+            f"actual={len(args)}, canonical={len(_canonical)}"
+        )
+        index_replacements: dict = {}
+        for actual_group, canonical_group in zip(args, _canonical, strict=True):
+            assert len(actual_group) == len(canonical_group), (
+                f"inner_fn index rank changed: actual={len(actual_group)}, canonical={len(canonical_group)}"
+            )
+            for actual, canonical in zip(actual_group, canonical_group, strict=True):
+                if actual == sympy.S.Zero:
+                    continue
+                previous = index_replacements.setdefault(actual, canonical)
+                assert previous == canonical, (
+                    f"live inner_fn index maps to multiple canonical indices: {actual} -> {previous}, {canonical}"
+                )
+        with V.set_ops_handler(
+            InputEdgeSwapHandler(V.ops, _swaps, _map, index_replacements)
+        ):
+            return _orig(*args)
+
+    object.__setattr__(op.data, "inner_fn", new_inner_fn)
+
     redirect_computed_buffer_reads(
         op,
-        name_map,
+        {},
         operations,
         pass_name="insert_restickify",
         reason="redirect consumer to restickified input",
@@ -396,8 +614,11 @@ def finalize_layouts(graph: GraphLowering) -> None:
                 accum_layout = mut_target_buf.get_layout()
                 if isinstance(accum_layout, FixedTiledLayout):
                     committed = accum_layout.device_layout
+        edge_occurrences: dict[tuple, int] = {}
         for edge, target_stl in cost_fn.required_input_stls(committed):
-            input_buf = graph.get_buffer(edge.dep.name)
+            name = edge.dep.name
+            key = (name, edge.dep.index)
+            input_buf = graph.get_buffer(name)
             in_layout = input_buf.get_layout()
             if isinstance(in_layout, MutationLayoutSHOULDREMOVE):
                 # Reading real_layout() through a mutation layout is only valid
@@ -430,6 +651,11 @@ def finalize_layouts(graph: GraphLowering) -> None:
             in_stl = in_layout.device_layout
             restick_stl = edge.layout(in_stl, target_stl)
             if restick_stl is None:
+                # No restickify needed for this edge, but still advance the occurrence
+                # counter so a later edge for the same dep (self-alias) gets the right
+                # occurrence number and isn't conflated with this one by the fallback
+                # path in InputEdgeSwapHandler.
+                edge_occurrences[key] = edge_occurrences.get(key, 0) + 1
                 continue
             if restick_stl is EdgeCostMap.INFEASIBLE:
                 raise AssertionError(
@@ -439,11 +665,15 @@ def finalize_layouts(graph: GraphLowering) -> None:
                     f"target_stl.stride_map={list(target_stl.stride_map)}"
                 )
             restick_target = _fixed_tiled(in_layout, restick_stl)
+            occurrence = edge_occurrences.get(key, 0)
+            edge_occurrences[key] = occurrence + 1
             logger.info(
                 f"Injecting restickify on {op.get_name()} input {edge.dep.name}: "
                 f"{list(in_stl.stride_map)} -> {list(target_stl.stride_map)}"
             )
-            _record_restickify(op, edge.dep.name, restick_target, plan)
+            _record_restickify(
+                op, edge.dep.name, edge.dep.index, occurrence, restick_target, plan
+            )
 
     V.graph.restickify_plan = plan
     if logger.isEnabledFor(logging.DEBUG):
@@ -482,15 +712,83 @@ def finalize_layouts(graph: GraphLowering) -> None:
             logger.debug("restickify plan: (none)")
 
 
+def _retarget_internal_buf_mutation(
+    graph: GraphLowering, mutation_op: ComputedBuffer, target_name: str
+) -> None:
+    """Retarget an internal-buffer mutation onto the alt-layout buffer.
+
+    An internal buffer is compiler-allocated (a torch.cat output from empty() +
+    sliced mutate_to, say), so it has no caller address to preserve and no
+    pre-existing data. Unlike the graph-input path it needs neither a
+    pre-restickify nor a copy-back: propagate_spyre_tensor_layouts already chose
+    alt_stl and finalize_layouts wrapped it into the buffer's FixedTiledLayout,
+    so this only rebinds the write onto it.
+
+    Only single-level views are supported. Chained slices of realized storage
+    collapse into one view on SliceView.create's fast path; an unrealized operand
+    takes the generic reindex path and would arrive nested, which the target
+    identity assertion below rejects.
+    """
+    target_buf = graph.get_buffer(target_name)
+    # finalize_layouts has already wrapped alt_stl into the buffer's layout.
+    assert isinstance(target_buf.layout, FixedTiledLayout), (
+        f"internal-buf mutation target {target_name} is "
+        f"{type(target_buf.layout).__name__}, expected FixedTiledLayout"
+    )
+
+    original_layout = mutation_op.layout
+    assert isinstance(original_layout, MutationLayoutSHOULDREMOVE)
+    target = original_layout.target
+
+    if isinstance(target, BaseView):
+        inner = target.data
+        while isinstance(inner, MutableBox):
+            inner = inner.data
+        # By name, not identity: a mutate_to over a clone()'d base reaches a
+        # distinct ComputedBuffer sharing the target's name.
+        inner_name = inner.get_name() if isinstance(inner, Buffer) else None
+        assert inner_name == target_name, (
+            f"internal-buf mutation target {target_name} is a multi-level view "
+            f"({type(target).__name__} over {type(inner).__name__}); only "
+            f"single-level views are supported"
+        )
+        slice_layout = target.get_layout()
+        new_target = ReinterpretView(data=StorageBox(target_buf), layout=slice_layout)
+    else:
+        assert isinstance(target, (Buffer, MutableBox)), (
+            f"internal-buf mutation target {target_name} has unexpected target type "
+            f"{type(target).__name__}"
+        )
+        new_target = target_buf
+
+    mutation_op.layout = MutationLayoutSHOULDREMOVE(new_target)
+
+    logger.info(
+        "insert_post_mutation_restickify: internal target %s retargeted via %s "
+        "(alt layout, no copy-back)",
+        target_name,
+        mutation_op.get_name(),
+    )
+
+
 def insert_post_mutation_restickify(graph: GraphLowering) -> None:
     """
-    Insert pre/post ops around a slice mutation when the original layout cannot
-    express the required stick offset.
+    Move a slice mutation onto an alternate layout when the original layout
+    cannot express the required stick offset.
 
     In that case, propagate_layouts picks an alternate layout and stores
-    op._restickify_plan = (target_name, orig_stl, alt_stl). Because the
-    restickify op cannot write its output in place, the mutation writes into a
-    temporary buffer buf_tmp in alt_stl layout. This pass inserts:
+    op._restickify_plan = (target_name, orig_stl, alt_stl). What this pass then
+    does depends on the target kind:
+
+    An **internal buffer** is compiler-allocated, so it is already allocated in
+    alt_stl and has no caller address or prior data to preserve. Nothing is
+    inserted; the write is only rebound onto the alt-layout buffer. See
+    _retarget_internal_buf_mutation.
+
+    A **graph input** must keep its address and surrounding data, so it needs the
+    full sequence below. Because the restickify op cannot write its output in
+    place, the mutation writes into a temporary buffer buf_tmp in alt_stl layout.
+    This pass inserts:
 
       1. restickify op: arg0_1 (orig_stl) -> buf_tmp        (alt_stl)
       2. mutation op:   buf               -> buf_tmp[slice] (alt_stl)
@@ -523,7 +821,9 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
         assert isinstance(mutation_op, ComputedBuffer)
 
         graph_input = graph.graph_inputs.get(target_name)
-        assert graph_input is not None
+        if graph_input is None:
+            _retarget_internal_buf_mutation(graph, mutation_op, target_name)
+            continue
 
         # Create fresh layouts here, since reusing base_layout would overwrite
         # arg0_1's address during hbm_pool_planning.
@@ -551,8 +851,10 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
         original_layout = mutation_op.layout
         assert isinstance(original_layout, MutationLayoutSHOULDREMOVE)
         slice_layout = original_layout.target.get_layout()
-        # We only reach this pass because the write stick had a non-zero offset,
-        # so the slice layout must carry it.
+        # A graph-input mutation reaches this pass only with a non-zero write
+        # offset: propagate_layouts rejects the offset-free (sub-stick) case
+        # before committing an alt layout, so the slice layout must carry the
+        # offset here.
         assert slice_layout.offset != 0, (
             f"slice offset lost while retargeting mutation {mutation_name} "
             f"(target={type(original_layout.target).__name__}, "

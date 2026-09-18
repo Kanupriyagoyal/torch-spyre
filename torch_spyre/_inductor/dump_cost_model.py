@@ -27,18 +27,17 @@ this extraction.
 
 import math
 import os
+from typing import Mapping, Optional
 
-from torch._inductor.ir import ComputedBuffer
+from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE
 
 
 from .constants import BATCH_MATMUL_OP
 from .cost_model import ArgTraffic, OpFeatures, explain, max
+from .logging_utils import get_logger, warn_once
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 
-from typing import Mapping, Optional, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+logger = get_logger("cost_model")
 
 
 def cost_dump_enabled() -> bool:
@@ -90,17 +89,39 @@ def _work_slices(op, write_index, read_index, iteration_space, work_slices=None)
     )
 
 
-def _cores(op, work_slices=None) -> int:
+def _resolved_work_slices(op, work_slices=None) -> dict:
+    """The op's complete symbol-keyed core-split map (``{}`` when unavailable):
+    the explicit candidate during LX planning, else the committed ownership."""
     try:
         rw = op.get_read_writes()
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         it_space = iteration_space_from_op(op)
-        return math.prod(
-            _work_slices(op, write_index, read_index, it_space, work_slices).values()
-        )
+        return _work_slices(op, write_index, read_index, it_space, work_slices) or {}
+    except Exception:  # noqa: BLE001 - best-effort feature extraction
+        return {}
+
+
+def _cores(op, work_slices=None) -> int:
+    slices = _resolved_work_slices(op, work_slices)
+    return math.prod(slices.values()) if slices else 1
+
+
+def _replication(index, slices: dict):
+    """How many cores each load this read's bytes: the product of the op's core
+    splits on iteration symbols the read index does not contain. A split on a dim
+    the read indexes hands each core a different slice (no replication); a split on
+    a dim it does not index puts the same slice on every core of that split. The
+    symbols are the op's own iteration symbols, so indirect-access symbols in the
+    index are simply never split keys. Splits may be solver symbols (co-optimizing
+    path), in which case the product is a sympy expression, like ``cores``."""
+    if index is None or not slices:
+        return 1
+    try:
+        present = set(getattr(index, "free_symbols", ()) or ())
     except Exception:  # noqa: BLE001 - best-effort feature extraction
         return 1
+    return math.prod(split for sym, split in slices.items() if sym not in present)
 
 
 def _mem_of_layout(layout) -> str:
@@ -381,9 +402,9 @@ def _matmul_features(
                 n_size = _int(it_space[n_sym], 1) if n_sym is not None else 1
                 m_split = max(1, readable.get(m_sym, 1))
                 n_split = max(1, readable.get(n_sym, 1)) if n_sym is not None else 1
-                if m_size > 1:
+                if m_size:
                     rows_per_core = m_size / m_split
-                if n_size > 1:
+                if n_size:
                     cols_per_core = n_size / n_split
                 a_bytes = m_size * k_size * dtype_bytes
                 b_bytes = k_size * n_size * dtype_bytes
@@ -468,8 +489,144 @@ def _hbm_pattern(op, is_reduction: bool, out_dims) -> str:
         return ""
 
 
+def _per_core_run(view, device_dims) -> tuple:
+    """(contiguous device elements one core owns per run, split of the dim that
+    bounds it) for a PerCoreView over ``device_dims``.
+
+    The view's ``work_slice_dims`` is keyed by DEVICE-dim index, so the innermost
+    (largest-index) split dim bounds each core's contiguous run at
+    ``(device_dims[d] // split) * prod(device_dims[d+1:])``. Validated against real
+    plans: logical [8,256,512] lays out as [256,8,8,64], a ``{B:4,M:2}`` hint gives
+    view ((0,2),(2,4)) -> (8//4)*64 = 128 elements (256 B), the geometry the
+    relayout cost law was fitted at.
+    """
+    splits = dict(view.work_slice_dims)
+    if not splits:
+        return _prod_ints(device_dims), 1
+    d = max(splits)
+    inner = _prod_ints(device_dims[d + 1 :]) or 1
+    return (device_dims[d] // splits[d]) * inner, splits[d]
+
+
+def governing_run_split(source_view, destination_view, device_dims) -> tuple:
+    """(run_elems, split) of the FINER of the two views - the side the law keys on.
+
+    Governing side = smaller per-core run; on a run tie the LARGER split (at
+    equal run the higher split measured ~3.6x slower). Direction-symmetric, as
+    the fitted law requires (8.721 vs 8.701 us with the pair reversed). Shared
+    by the extractor here and the solver's candidate enumeration
+    (``lx_relayout.solver_relayout_pair_cost``) so the two paths cannot drift.
+    """
+    src = _per_core_run(source_view, device_dims)
+    dst = _per_core_run(destination_view, device_dims)
+    return min(src, dst, key=lambda t: (t[0], -t[1]))
+
+
+def _relayout_features(op, out_dims):
+    """(is_lx_relayout, relayout_run_elems, relayout_split) for one op.
+
+    The materialization registry is the authority: an op is a relayout copy iff the
+    scratchpad planner registered it (``graph._spyre_lx_relayout_copies``), so a plan
+    the allocator or scheduler later demoted never reaches here as a relayout. The
+    governing geometry is the FINER of the plan's two views (smaller per-core run);
+    the term's law is direction-symmetric (measured: 8.721 vs 8.701 us reversed), so
+    which side is source does not matter. All-zeros for every other op.
+    """
+    zeros = (False, 0, 0)
+    try:
+        from torch._inductor.virtualized import V
+
+        from .scratchpad.lx_relayout import materialized_lx_relayouts
+
+        registry = materialized_lx_relayouts(V.graph)
+        if not registry:
+            return zeros
+        # The registry records the COPY BUFFER's name (materialize_lx_relayouts
+        # stores ``copy.get_name()``, e.g. "buf2"); ``get_operation_name()`` is the
+        # op name ("op2"), so match on the buffer name.
+        name = op.get_name()
+        plan = next(
+            (p for copy_name, p in registry.values() if copy_name == name), None
+        )
+        if plan is None:
+            return zeros
+        run_elems, split = governing_run_split(
+            plan.source_view, plan.destination_view, out_dims
+        )
+        if run_elems <= 0 or split <= 0:
+            return zeros
+        return True, run_elems, split
+    except Exception as exc:  # noqa: BLE001 - a diagnostic feature must not sink a compile
+        # Deliberately broad, but never silent: a regression in the registry
+        # lookup (say an AttributeError from a PerCoreView refactor) must not
+        # masquerade as "no relayouts found" forever.
+        _relayout_logger().debug(
+            "relayout feature extraction failed for %s: %r", op.get_name(), exc
+        )
+        return zeros
+
+
+def _graph_boundary_names() -> tuple[set, set] | None:
+    """(graph input names, graph output names) of the graph being lowered.
+
+    ``None`` when there is no active ``V.graph`` (the extractor also runs from offline
+    tooling, and ``build_report`` is unit-testable without a ``GraphLowering``). The
+    callers leave every arg unstamped in that case, so ``ArgTraffic.is_boundary`` falls
+    back to the naming convention -- stamping ``False`` instead would be taken as an
+    authoritative "not a boundary arg" and would silently disable the external-input
+    de-duplication in ``_fused_hbm_bytes`` as well.
+    """
+    try:
+        from torch._inductor.virtualized import V
+
+        return set(V.graph.graph_input_names), set(V.graph.get_output_names())
+    except Exception:  # noqa: BLE001 - best-effort feature extraction
+        return None
+
+
+def _writes_graph_output(op, graph_outputs: set) -> bool | None:
+    """Whether ``op``'s write is the externally-visible write of a graph output.
+
+    Not simply ``op.get_name() in graph_outputs``: a ``MutationLayoutSHOULDREMOVE`` op
+    writes into ANOTHER buffer, and it is that target -- not the op's own name -- that
+    the graph returns. Same distinction ``loop_info.PropagationPlan.graph_output_name``
+    records.
+
+    ``None`` when the op cannot be read, meaning UNKNOWN. ``False`` is authoritative
+    "interior write", and unlike the input side an output arg has no naming-convention
+    fallback to recover from a wrong one -- it would silently free the store under
+    residency, which is exactly the under-charge of #4271. Unknown is not silent
+    either: nothing downstream can tell the two apart, so this is where it is said.
+    """
+    try:
+        if op.get_name() in graph_outputs:
+            return True
+        layout = op.get_layout()
+        if isinstance(layout, MutationLayoutSHOULDREMOVE):
+            return layout.get_buffer().get_name() in graph_outputs
+    except Exception as exc:  # noqa: BLE001 - best-effort feature extraction
+        name = getattr(op, "name", None) or type(op).__name__
+        warn_once(
+            logger,
+            f"graph-output-stamp:{name}",
+            "cannot tell whether %s writes a graph output (%s); its store is left "
+            "unstamped and priced as interior traffic, so LX residency will free "
+            "bytes the graph boundary still moves",
+            name,
+            exc,
+        )
+        return None
+    return False
+
+
+def _relayout_logger():
+    from .logging_utils import get_inductor_logger
+
+    return get_inductor_logger("dump_cost_model")
+
+
 def extract_op_features(
-    op, work_slices=None, buffers: Optional[Mapping[str, "LifetimeBoundBuffer"]] = None
+    op, work_slices=None, is_lx: Optional[Mapping[str, bool]] = None
 ) -> OpFeatures:
     """Build OpFeatures for one ComputedBuffer op (best-effort).
 
@@ -477,10 +634,19 @@ def extract_op_features(
     planning. Otherwise committed pre-scheduler ownership is used, falling back
     to legacy coefficient-keyed Scheduler transport after finalization.
 
-    buffers is an optional name -> LifetimeBoundBuffer map used for creating a
-    symbolic cost model.
+    ``is_lx`` is a name -> residency map (e.g. a co-optimizer's per-buffer
+    symbolic ``sym_is_lx``) consulted for each arg (the op's own output and
+    every input read); a name absent from the map -- or an empty map -- falls
+    back to the arg's committed layout.
+
+    Each arg is also stamped with ``is_boundary``: whether ITS traffic crosses the
+    graph boundary, resolved against the arg's own role, so a buffer that is both a
+    graph input and a graph output (a returned view of an input; a mutated input that
+    is returned) needs no special case.
     """
-    buf = buffers.get(op.name) if buffers else None
+    is_lx = is_lx or {}
+    boundary = _graph_boundary_names()
+    graph_inputs, graph_outputs = boundary if boundary is not None else (None, None)
     data = getattr(op, "data", None)
     is_reduction = getattr(data, "reduction_type", None) is not None
     loop_trip, tiles_red_dim, tiles_out_dim = _loop_features(op)
@@ -499,7 +665,8 @@ def extract_op_features(
     out_dims = _device_dims(op.get_layout()) or out_size
     out_elems = _prod_ints(out_dims)
 
-    cores = _cores(op, work_slices)
+    slices = _resolved_work_slices(op, work_slices)
+    cores = math.prod(slices.values()) if slices else 1
 
     # Cross-core ring combine: work division splits OUTPUT dims first, then the reduced
     # axis with leftover cores -> the reduced axis is split only when out_elems < cores.
@@ -508,7 +675,7 @@ def extract_op_features(
     if is_reduction:
         reduction_cores = max(1, cores // max(1, out_elems))
 
-    is_lx = buf.sym_is_lx if buf else _mem_of_layout(op.get_layout()) == "lx"
+    out_is_lx = is_lx.get(op.name, _mem_of_layout(op.get_layout()) == "lx")
 
     # Matmul (batchmatmul reduction): compute-bound -> extra additive compute term. Pull
     # MACs (M*N*K), the per-core M tile (pt_eff), and the K-split k (-> reduction_cores,
@@ -557,7 +724,7 @@ def extract_op_features(
         # same fix, as _matmul_features' batch-dim exclusion above.
         rows = (out_size[-2] if len(out_size) >= 2 else 0) or out_dims[-2]
         # full-buffer alloc: per-tile slice is rows / loop_trip
-        rows = rows / loop_trip * (1 - is_lx) + rows * is_lx
+        rows = rows / loop_trip * (1 - out_is_lx) + rows * out_is_lx
         # `loop_trip > 1` is guaranteed by the branch condition; `_row_split` can in
         # principle return 0 if a split map ever records one, and this term is a
         # diagnostic -- a ZeroDivisionError here would take down a compile for a number
@@ -598,11 +765,20 @@ def extract_op_features(
         ArgTraffic(
             name=op.get_operation_name(),
             role="output",
-            is_lx=is_lx,
+            is_lx=out_is_lx,
             elems=out_elems,
             dims=list(out_dims),
             logical=list(out_size),
             loop_factor=out_factor,
+            # Against the op's BUFFER name (and its mutation target), not the
+            # operation name this arg carries. ``None`` means unstamped, not
+            # "not a boundary": no graph at all (see _graph_boundary_names), or
+            # an op _writes_graph_output could not read.
+            is_boundary=(
+                None
+                if graph_outputs is None
+                else _writes_graph_output(op, graph_outputs)
+            ),
         )
     )
     # Input args, from the op's reads. Each read is sized by ITS OWN buffer's device
@@ -640,11 +816,7 @@ def extract_op_features(
                 dims, in_elems, in_logical = list(out_dims), out_elems, []
             inp_is_lx = False
         else:
-            if buffers:
-                inp_buf = buffers.get(name)
-                inp_is_lx = inp_buf.sym_is_lx if inp_buf is not None else (mem == "lx")
-            else:
-                inp_is_lx = mem == "lx"
+            inp_is_lx = is_lx.get(name, mem == "lx")
         args.append(
             ArgTraffic(
                 name=name,
@@ -660,8 +832,15 @@ def extract_op_features(
                     if (_levels and index is not None)
                     else in_factor
                 ),
+                is_boundary=(None if graph_inputs is None else name in graph_inputs),
+                # Matmul consumers only: rung-G verified a pointwise broadcast
+                # operand loads once per kernel, the relayout sweep measured a bmm
+                # operand loading once per replicated core (cost_model.ArgTraffic).
+                replication=_replication(index, slices) if is_matmul else 1,
             )
         )
+
+    _rl = _relayout_features(op, out_dims)
 
     return OpFeatures(
         name=_op_name(op),
@@ -684,6 +863,9 @@ def extract_op_features(
         matmul_m_split=matmul_m_split,
         matmul_n_split=matmul_n_split,
         hbm_pattern="" if is_matmul else _hbm_pattern(op, is_reduction, out_dims),
+        is_lx_relayout=_rl[0],
+        relayout_run_elems=_rl[1],
+        relayout_split=_rl[2],
     )
 
 
@@ -716,10 +898,13 @@ def _record_last_io(feats: list) -> None:
         args = []
         for a in o.args:
             bs = a.elems * o.dtype_bytes
-            # Every HBM arg counts at its own size x loop_factor (L for a per-tile
-            # accumulator re-accessed each loop iteration, 1 otherwise); broadcast
-            # operands carry their small one-load size (counted, not zeroed). LX ~free.
-            counted = bs * a.loop_factor if a.mem == "hbm" else 0
+            # Same accounting as ``hbm_bytes()`` below, so the per-arg breakdown sums
+            # to the total: own size x loop_factor for an HBM arg (L for a per-tile
+            # accumulator re-accessed each loop iteration, 1 otherwise), the small
+            # one-load size for a broadcast operand, ~free for LX -- except a graph
+            # output's write, which stays charged despite LX, and the clone-in load of
+            # a resident graph input whose clone this bundle pays for.
+            counted = (a.hbm_elems() + a.clone_in_elems()) * o.dtype_bytes
             args.append(
                 {
                     "name": a.name,

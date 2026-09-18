@@ -300,7 +300,6 @@ class TestSpyre(TestCase):
             subtest(
                 (torch.int64, lambda: torch.tensor(10, dtype=torch.int64), None),
                 name="int64",
-                decorators=[_SCALAR_ADD_XFAIL_TO_DTYPE],
             ),
             subtest(
                 (torch.uint8, lambda: torch.tensor(10, dtype=torch.uint8), None),
@@ -818,6 +817,91 @@ class TestSpyre(TestCase):
             # H2D: Expect error when moving to Spyre with unsupported dst_dtype
             with self.assertRaises(RuntimeError):
                 tensor.to("spyre", dtype=dst_dtype)
+
+    def test_d2d_dtype_conversion_overloads(self):
+        """Dtype-only ``Tensor.to`` overloads use the compiled D2D conversion.
+
+        In particular, ``x.to(torch.float32)`` must recognize its first
+        positional argument as a dtype rather than raw-copying bf16 bits into
+        an fp32 allocation. D2D conversions produce a staggered element
+        arrangement, so convert back to the source dtype before comparing on
+        CPU.
+        """
+        from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
+
+        pairs = (
+            (torch.float16, torch.float32),
+            (torch.bfloat16, torch.float32),
+            (torch.float32, torch.float16),
+            (torch.float32, torch.bfloat16),
+        )
+
+        for src_dtype, dst_dtype in pairs:
+            base_cpu = torch.linspace(-4, 4, 512, dtype=src_dtype).reshape(4, 128)
+            source_cpu = base_cpu[1:3]
+            source = base_cpu.to("spyre")[1:3]
+            self.assertEqual(source.storage_offset(), 128)
+            expected = source_cpu.to(dst_dtype).to(src_dtype)
+            other = torch.empty_like(source, dtype=dst_dtype)
+            expected_ea = (
+                ElementArrangement.DL16_TO_FP32
+                if dst_dtype == torch.float32
+                else ElementArrangement.FP32_TO_DL16
+            )
+
+            conversions = (
+                ("positional dtype", lambda: source.to(dst_dtype)),
+                ("keyword dtype", lambda: source.to(dtype=dst_dtype)),
+                ("device and dtype", lambda: source.to("spyre", dtype=dst_dtype)),
+                ("other tensor", lambda: source.to(other)),
+            )
+            for overload, convert in conversions:
+                with self.subTest(
+                    src_dtype=src_dtype,
+                    dst_dtype=dst_dtype,
+                    overload=overload,
+                ):
+                    actual = convert()
+                    self.assertEqual(actual.device.type, "spyre")
+                    self.assertEqual(actual.dtype, dst_dtype)
+                    self.assertEqual(
+                        get_spyre_tensor_layout(actual).element_arrangement,
+                        expected_ea,
+                    )
+                    restored = actual.to(src_dtype)
+                    self.assertEqual(
+                        get_spyre_tensor_layout(restored).element_arrangement,
+                        ElementArrangement.STANDARD,
+                    )
+                    atol, rtol = (
+                        (1e-2, 1.6e-2)
+                        if torch.bfloat16 in (src_dtype, dst_dtype)
+                        else (1e-3, 1e-3)
+                    )
+                    torch.testing.assert_close(
+                        restored.cpu(), expected, atol=atol, rtol=rtol
+                    )
+
+    def test_unsupported_d2d_dtype_conversion_falls_back(self):
+        """Unsupported native D2D pairs retain the CPU fallback behavior."""
+        from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        source_cpu = torch.arange(128, dtype=torch.int32).reshape(2, 64)
+        source = source_cpu.to("spyre")
+
+        with self.assertWarnsRegex(
+            FallbackWarning,
+            r"conversion from torch\.int32 to torch\.float16 is falling back to cpu",
+        ):
+            actual = source.to(torch.float16)
+
+        self.assertEqual(actual.dtype, torch.float16)
+        self.assertEqual(
+            get_spyre_tensor_layout(actual).element_arrangement,
+            ElementArrangement.STANDARD,
+        )
+        torch.testing.assert_close(actual.cpu(), source_cpu.to(torch.float16))
 
 
 if __name__ == "__main__":
