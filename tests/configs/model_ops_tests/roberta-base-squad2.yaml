@@ -553,8 +553,8 @@ test_suite_config:
                   sample_inputs_func:
                     args:
                       - tensor:
-                          shape: [1, 1, 40, 1]
-                          stride: [40, 40, 1, 1]
+                          shape: []
+                          stride: []
                           storage_offset: 0
                           dtype: torch.bool
                           device: cuda
