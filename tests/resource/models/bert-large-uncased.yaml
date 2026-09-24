@@ -308,8 +308,8 @@ cases:
     op: torch.bitwise_and
     inputs:
       - tensor:
-          shape: [1, 1, 13, 1]
-          stride: [13, 13, 1, 1]
+          shape: []
+          stride: []
           storage_offset: 0
           dtype: torch.bool
           device: cuda
